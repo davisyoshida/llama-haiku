@@ -35,11 +35,19 @@ def get_model(model_dir, return_past=False, return_hidden=False):
     model = hk.without_apply_rng(hk.transform(fn))
     return model, params
 
-def get_generator(model_dir, cache_step_size=25, donate_past=True, return_hidden=False):
+def get_generator(model_dir, cache_step_size=25, donate_past=True, return_hidden=False, output_transform=None):
     model, params = get_model(model_dir, return_past=True, return_hidden=return_hidden)
 
+
+    def model_fn(params, input_ids, use_cache_size, past):
+        ret = model.apply(params, input_ids, use_cache_size, past)
+        if output_transform is not None:
+            ret = output_transform(ret)
+        return ret
+
     donate_argnums = (3,) if donate_past else ()
-    jit_fn = jax.jit(model.apply, static_argnums=(2,), donate_argnums=donate_argnums)
+    jit_fn = jax.jit(model_fn, static_argnums=(2,), donate_argnums=donate_argnums)
+
 
     def step_fn(input_ids, past=None):
         input_length = input_ids.shape[-1]

@@ -35,13 +35,13 @@ def get_model(model_dir, return_past=False, return_hidden=False):
     model = hk.without_apply_rng(hk.transform(fn))
     return model, params
 
-def get_model_with_past(model_dir, cache_step_size=25, donate_past=True, return_hidden=False):
+def get_generator(model_dir, cache_step_size=25, donate_past=True, return_hidden=False):
     model, params = get_model(model_dir, return_past=True, return_hidden=return_hidden)
 
     donate_argnums = (3,) if donate_past else ()
     jit_fn = jax.jit(model.apply, static_argnums=(2,), donate_argnums=donate_argnums)
 
-    def step_fn(params, input_ids, past=None):
+    def step_fn(input_ids, past=None):
         input_length = input_ids.shape[-1]
         total_length = input_length + (past[1] if past else 0)
 

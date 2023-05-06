@@ -9,8 +9,6 @@ import jax.numpy as jnp
 import haiku as hk
 import numpy as np
 
-import lorax
-
 from .model import LlamaConfig, LlamaModel
 from .utils import simple_dtype_policy
 

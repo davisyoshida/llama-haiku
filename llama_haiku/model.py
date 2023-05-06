@@ -32,14 +32,14 @@ class VarianceOnlyLayerNorm(ConfigModule):
     """LayerNorm but without subtracting the mean"""
     def __call__(self, x):
         # TODO: Decide if use_fast_variance technique from hk.LayerNorm is helpful
-        variance = jnp.var(x, axis=-1, keepdims=True)
+        variance = jnp.var(x.astype(jnp.float32), axis=-1, keepdims=True)
         scale = hk.get_parameter(
             'weight',
             x.shape[-1:],
             init=hk.initializers.Constant(1.)
         )
         x = x * jax.lax.rsqrt(variance + self.config.rms_norm_eps)
-        return x * scale
+        return (x * scale).astype(get_dtype())
 
 def rotate_half(x):
     n = x.shape[-1] // 2
@@ -51,18 +51,19 @@ class LlamaRotaryEmbedding(ConfigModule):
     def __init__(self, config, base=10000):
         super().__init__(config=config)
         self.base = base
+
+    def __call__(self, queries, keys, pos_ids):
         head_dim = self.config.hidden_size // self.config.num_attention_heads
         dtype = get_dtype()
 
         inv_freq = 1 / (self.base ** (jnp.arange(0, head_dim, 2.0, dtype=dtype) / head_dim))
-        freqs = jnp.arange(config.max_position_embeddings)[:, None] * inv_freq[None, :]
+        freqs = jnp.arange(self.config.max_position_embeddings)[:, None] * inv_freq[None, :]
         emb = jnp.concatenate([freqs, freqs], axis=-1)
-        self.sin = jnp.sin(emb)
-        self.cos = jnp.cos(emb)
+        sin = jnp.sin(emb)
+        cos = jnp.cos(emb)
 
-    def __call__(self, queries, keys, pos_ids):
-        cos = self.cos[pos_ids]
-        sin = self.sin[pos_ids]
+        cos = cos[pos_ids]
+        sin = sin[pos_ids]
         q_emb = queries * cos + rotate_half(queries) * sin
         k_emb = keys * cos + rotate_half(keys) * sin
         return q_emb, k_emb
@@ -90,7 +91,12 @@ class LlamaAttention(ConfigModule):
 
         # n_head x time x head_dim
         queries, keys, values = [
-            hk.Linear(self.config.hidden_size, name=f'{name}_proj', with_bias=False)(hidden_states).reshape(-1, self.config.num_attention_heads, head_dim).transpose(1, 0, 2)
+            jax.ad_checkpoint.checkpoint_name(
+                hk.Linear(self.config.hidden_size, name=f'{name}_proj', with_bias=False)(hidden_states).reshape(
+                    -1, self.config.num_attention_heads, head_dim
+                ).transpose(1, 0, 2),
+                name=f'llama_{name}_proj'
+            )
             for name in 'qkv'
         ]
 
@@ -172,12 +178,13 @@ class LlamaModel(ConfigModule):
         past=None,
         past_cache_size=None,
         return_past=False,
-        return_hidden=False
+        return_hidden=False,
+        checkpoint=False,
     ):
         inp_length = input_ids.shape[-1]
         if past is None:
             past_length = 0
-            if past_cache_size:
+            if past_cache_size is not None:
                 cache_shape = (
                     2,
                     self.config.num_attention_heads,
@@ -224,12 +231,18 @@ class LlamaModel(ConfigModule):
             if return_hidden:
                 hidden.append(hidden_states)
             layer = LLamaDecoderLayer(config=self.config, pos_emb=pos_emb, name=f'layer_{layer_num}')
+            if checkpoint:
+                layer = hk.remat(
+                    layer,
+                    static_argnums=(3,),
+                )
             hidden_states, present = layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=indices,
-                past=(layer_past, past_length)
+                hidden_states,
+                attention_mask,
+                indices,
+                (layer_past, past_length)
             )
+            hidden_states = jax.ad_checkpoint.checkpoint_name(hidden_states, f'llama_hidden_state_{layer_num}')
             presents.append(present)
 
         norm_out = VarianceOnlyLayerNorm(self.config, name='norm')(hidden_states)

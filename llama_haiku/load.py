@@ -64,11 +64,13 @@ def get_generator(
     apply_wrapper=None,
     return_hidden=False,
     params_wrapper=None,
+    device=None
 ):
     model, params = get_model(
         model_dir,
         return_past=True,
         return_hidden=return_hidden,
+        device=device
     )
 
     apply_fn = model.apply

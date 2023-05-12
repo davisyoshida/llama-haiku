@@ -11,10 +11,23 @@ ALPACA_FORMAT = (
     "{}"
 )
 
+ALPACA_CONTEXT_FORMAT = (
+    "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n"
+    "### Instruction:\n"
+    "{}\n\n"
+    "#### Input:\n"
+    "{}\n\n"
+    "### Response:\n"
+    "{}"
+)
+
 def alpaca_prompt(
     request,
-    response_prefix=""
+    response_prefix="",
+    inp=""
 ):
+    if inp:
+        return ALPACA_CONTEXT_FORMAT.format(request, inp, response_prefix)
     return ALPACA_FORMAT.format(request, response_prefix)
 
 

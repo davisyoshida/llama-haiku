@@ -5,6 +5,7 @@ import logging
 import haiku as hk
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 import jmp
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,7 @@ class LlamaAttention(ConfigModule):
 
         # n_head x time x head_dim
         queries, keys, values = [
-            jax.ad_checkpoint.checkpoint_name(
+            checkpoint_name(
                 hk.Linear(self.config.hidden_size, name=f'{name}_proj', with_bias=False)(hidden_states).reshape(
                     -1, self.config.num_attention_heads, head_dim
                 ).transpose(1, 0, 2),

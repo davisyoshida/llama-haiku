@@ -30,6 +30,26 @@ def alpaca_prompt(
         return ALPACA_CONTEXT_FORMAT.format(request, inp, response_prefix)
     return ALPACA_FORMAT.format(request, response_prefix)
 
+VICUNA_FORMAT = (
+    "### Human: {}\n"
+    "### Assistant:{}"
+)
+
+VICUNA_CONTEXT_FORMAT = (
+    "### Human: {}\n"
+    "Context: {}\n"
+    "### Assistant:{}"
+)
+
+def vicuna_prompt(
+    request,
+    response_prefix="",
+    inp=""
+):
+    if inp:
+        return VICUNA_CONTEXT_FORMAT.format(request, inp, response_prefix)
+    return VICUNA_FORMAT.format(request, response_prefix)
+
 
 def in_place_tree_map(f, tree):
     if isinstance(tree, dict):

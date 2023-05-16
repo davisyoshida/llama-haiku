@@ -41,17 +41,26 @@ def load_weights(path, name='weights.pkl', device=None):
     mapped_params.reverse()
     return jax.tree_util.tree_unflatten(structure, mapped_params)
 
-def get_model(model_dir, lora_file=None, return_past=False, return_hidden=False, device=None, custom_getter=None):
+def get_model(model_dir, return_past=False, return_hidden=False, device=None, custom_getter=None):
     model_dir = Path(model_dir)
     config = load_config(model_dir)
     params = load_weights(model_dir, device=device)
 
     simple_dtype_policy()
 
-    def fn(input_ids, use_cache_size=None, past=None, do_checkpoint=False):
+    def fn(input_ids, use_cache_size=None, past=None, do_checkpoint=False, do_mlp_checkpoint=False, mlp_block_size=None):
         with hk.custom_getter(custom_getter) if custom_getter is not None else nullcontext():
             model = LlamaModel(config)
-            ret = model(input_ids, past=past, past_cache_size=use_cache_size, return_past=return_past, return_hidden=return_hidden, checkpoint=do_checkpoint)
+            ret = model(
+                input_ids,
+                past=past,
+                past_cache_size=use_cache_size,
+                return_past=return_past,
+                return_hidden=return_hidden,
+                checkpoint=do_checkpoint,
+                checkpoint_mlp=do_mlp_checkpoint,
+                mlp_block_size=mlp_block_size
+            )
         return ret
 
     model = hk.without_apply_rng(hk.transform(fn))
@@ -92,6 +101,7 @@ def get_generator(
 
         use_cache_size = math.ceil(total_length / cache_step_size) * cache_step_size
 
+        added_padding = 0
         if past:
             curr_cache_size = past[0][0][0].shape[-2]
             if curr_cache_size < use_cache_size:
@@ -101,6 +111,23 @@ def get_generator(
                     curr_cache
                 )
                 past = (new_cache, length)
-        return jit_fn(params, input_ids, use_cache_size, past)
+        else:
+            pad_to = np.ceil(input_length / cache_step_size).astype(int) * cache_step_size
+            added_padding = pad_to - input_length
+            if added_padding > 0:
+                input_ids = jnp.pad(input_ids, ((0, added_padding)), constant_values=0)
+
+        result = jit_fn(params, input_ids, use_cache_size, past)
+
+        if added_padding > 0:
+            result['logits'] = result['logits'][:-added_padding, :]
+            past, past_length = result['past']
+
+            past_length -= added_padding
+            result['past'] = (past, past_length)
+
+            if 'hidden' in result:
+                result['hidden'] = jax.tree_map(lambda h: h[:-added_padding, :], result['hidden'])
+        return result
 
     return step_fn

@@ -52,19 +52,18 @@ class LlamaRotaryEmbedding(ConfigModule):
     def __init__(self, config, base=10000):
         super().__init__(config=config)
         self.base = base
-
-    def __call__(self, queries, keys, pos_ids):
         head_dim = self.config.hidden_size // self.config.num_attention_heads
         dtype = get_dtype()
 
         inv_freq = 1 / (self.base ** (jnp.arange(0, head_dim, 2.0, dtype=dtype) / head_dim))
         freqs = jnp.arange(self.config.max_position_embeddings)[:, None] * inv_freq[None, :]
         emb = jnp.concatenate([freqs, freqs], axis=-1)
-        sin = jnp.sin(emb)
-        cos = jnp.cos(emb)
+        self.sin = jnp.sin(emb)
+        self.cos = jnp.cos(emb)
 
-        cos = cos[pos_ids]
-        sin = sin[pos_ids]
+    def __call__(self, queries, keys, pos_ids):
+        cos = self.cos[pos_ids]
+        sin = self.sin[pos_ids]
         q_emb = queries * cos + rotate_half(queries) * sin
         k_emb = keys * cos + rotate_half(keys) * sin
         return q_emb, k_emb
@@ -129,9 +128,11 @@ class LlamaAttention(ConfigModule):
         return result, new_past
 
 class LLamaDecoderLayer(ConfigModule):
-    def __init__(self, pos_emb, **kwargs):
+    def __init__(self, pos_emb, checkpoint_mlp=False, mlp_block_size=None, **kwargs):
         super().__init__(**kwargs)
         self.pos_emb = pos_emb
+        self.checkpoint_mlp = checkpoint_mlp
+        self.mlp_block_size = mlp_block_size
 
     def __call__(
         self,
@@ -144,7 +145,11 @@ class LLamaDecoderLayer(ConfigModule):
 
         norm_output = VarianceOnlyLayerNorm(self.config, name='input_layernorm')(hidden_states)
 
-        attn_output, present = LlamaAttention(pos_emb=self.pos_emb, config=self.config, name='self_attn')(
+        attention_layer = LlamaAttention(pos_emb=self.pos_emb, config=self.config, name='self_attn')
+        if self.checkpoint_mlp:
+            attention_layer = hk.remat(attention_layer)
+
+        attn_output, present = attention_layer(
             norm_output,
             attention_mask,
             position_ids,
@@ -153,7 +158,23 @@ class LLamaDecoderLayer(ConfigModule):
         residual += attn_output
 
         post_attn_norm_output = VarianceOnlyLayerNorm(self.config, name='post_attention_layernorm')(residual)
-        mlp_output = LlamaMLP(self.config)(post_attn_norm_output)
+        mlp_layer = LlamaMLP(self.config)
+        if self.checkpoint_mlp:
+            mlp_layer = hk.remat(mlp_layer)
+
+        if self.mlp_block_size is None:
+            mlp_output = mlp_layer(post_attn_norm_output)
+        elif post_attn_norm_output.shape[0] % self.mlp_block_size == 0:
+            n_blocks = post_attn_norm_output.shape[0] // self.mlp_block_size
+            inps = jnp.split(post_attn_norm_output, n_blocks, axis=0)
+            outs = []
+            for inp in inps:
+                outs.append(mlp_layer(inp))
+            mlp_output = jnp.concatenate(outs, axis=0)
+        else:
+            raise ValueError(f'MLP block size must be a divisor of input length {inp.shape[0]}')
+
+        mlp_output = mlp_layer(post_attn_norm_output)
         residual += mlp_output
 
         return residual, present
@@ -181,6 +202,8 @@ class LlamaModel(ConfigModule):
         return_past=False,
         return_hidden=False,
         checkpoint=False,
+        checkpoint_mlp=False,
+        mlp_block_size=1,
     ):
         inp_length = input_ids.shape[-1]
         if past is None:
@@ -231,7 +254,13 @@ class LlamaModel(ConfigModule):
         for layer_num, layer_past in enumerate(past):
             if return_hidden:
                 hidden.append(hidden_states)
-            layer = LLamaDecoderLayer(config=self.config, pos_emb=pos_emb, name=f'layer_{layer_num}')
+            layer = LLamaDecoderLayer(
+                config=self.config,
+                pos_emb=pos_emb,
+                name=f'layer_{layer_num}',
+                checkpoint_mlp=checkpoint_mlp,
+                mlp_block_size=mlp_block_size,
+            )
             if checkpoint:
                 layer = hk.remat(
                     layer,
@@ -244,7 +273,8 @@ class LlamaModel(ConfigModule):
                 (layer_past, past_length)
             )
             hidden_states = jax.ad_checkpoint.checkpoint_name(hidden_states, f'llama_hidden_state_{layer_num}')
-            presents.append(present)
+            if return_past:
+                presents.append(present)
 
         norm_out = VarianceOnlyLayerNorm(self.config, name='norm')(hidden_states)
 

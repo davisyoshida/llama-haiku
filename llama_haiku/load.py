@@ -41,10 +41,11 @@ def load_weights(path, name='weights.pkl', device=None):
     mapped_params.reverse()
     return jax.tree_util.tree_unflatten(structure, mapped_params)
 
-def get_model(model_dir, return_past=False, return_hidden=False, device=None, custom_getter=None):
+def get_model(model_dir, return_past=False, return_hidden=False, device=None, custom_getter=None, get_params=True):
     model_dir = Path(model_dir)
     config = load_config(model_dir)
-    params = load_weights(model_dir, device=device)
+
+    params = load_weights(model_dir, device=device) if get_params else None
 
     simple_dtype_policy()
 

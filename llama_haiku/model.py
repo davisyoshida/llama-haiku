@@ -1,7 +1,10 @@
 """Adapted from torch implementation at https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py"""
 from collections import namedtuple
+from functools import partial
 import logging
+import warnings
 
+from flash_attention_jax import causal_flash_attention
 import haiku as hk
 import jax
 import jax.numpy as jnp
@@ -75,64 +78,13 @@ class LlamaMLP(ConfigModule):
 
         return hk.Linear(self.config.hidden_size, name='down_proj', with_bias=False)(gate * val)
 
+_weighted_sum_values = partial(jnp.einsum, 'hts,hsd->htd')
 class LlamaAttention(ConfigModule):
-    def __init__(self, pos_emb, **kwargs):
+    def __init__(self, pos_emb, use_flash_attention=False, **kwargs):
         super().__init__(**kwargs)
         self.pos_emb = pos_emb
-
-    def __call__(
-        self,
-        hidden_states,
-        attention_mask,
-        position_ids,
-        past
-    ):
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
-
-        # n_head x time x head_dim
-        queries, keys, values = [
-            checkpoint_name(
-                hk.Linear(self.config.hidden_size, name=f'{name}_proj', with_bias=False)(hidden_states).reshape(
-                    -1, self.config.num_attention_heads, head_dim
-                ).transpose(1, 0, 2),
-                name=f'llama_{name}_proj'
-            )
-            for name in 'qkv'
-        ]
-
-        q_len = hidden_states.shape[-2]
-
-        past_kv, past_length = past
-
-        queries, keys = self.pos_emb(queries, keys, position_ids)
-
-        if past_kv is not None:
-            keys, values = [
-                jax.lax.dynamic_update_slice_in_dim(p_tensor, curr_tensor, past_length, axis=1)
-                for p_tensor, curr_tensor in zip(past_kv, [keys, values])
-            ]
-
-        attention_weights = jnp.einsum('htd,hsd->hts', queries, keys) / jnp.sqrt(head_dim)
-        attention_weights += attention_mask
-        attention_weights = jax.nn.softmax(attention_weights, axis=-1)
-
-        expected_kv_size = hidden_states.shape[-2] if past_kv is None else past_kv[0].shape[1]
-        assert attention_weights.shape == (self.config.num_attention_heads, q_len, expected_kv_size), f'{attention_weights.shape} != {(self.config.num_attention_heads, q_len, expected_kv_size)}'
-
-        output = jnp.einsum('hts,hsd->htd', attention_weights, values)
-        assert output.shape == (self.config.num_attention_heads, q_len, head_dim)
-        output = output.transpose(1, 0, 2).reshape(-1, self.config.hidden_size)
-
-        result = hk.Linear(self.config.hidden_size, name='o_proj', with_bias=False)(output.reshape(-1, self.config.hidden_size))
-        new_past = (keys, values)
-        return result, new_past
-
-class LLamaDecoderLayer(ConfigModule):
-    def __init__(self, pos_emb, checkpoint_mlp=False, mlp_block_size=None, **kwargs):
-        super().__init__(**kwargs)
-        self.pos_emb = pos_emb
-        self.checkpoint_mlp = checkpoint_mlp
-        self.mlp_block_size = mlp_block_size
+        self.use_flash_attention = use_flash_attention
+        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
 
     def __call__(
         self,
@@ -140,12 +92,126 @@ class LLamaDecoderLayer(ConfigModule):
         attention_mask,
         position_ids,
         past,
+        no_cache_update=False
+    ):
+
+        # n_head x time x head_dim
+        queries, keys, values = [
+            checkpoint_name(
+                hk.Linear(self.config.hidden_size, name=f'{name}_proj', with_bias=False)(hidden_states).reshape(
+                    -1, self.config.num_attention_heads, self.head_dim
+                ).transpose(1, 0, 2),
+                name=f'llama_{name}_proj'
+            )
+            for name in 'qkv'
+        ]
+
+        queries, keys = self.pos_emb(queries, keys, position_ids)
+
+        q_len = hidden_states.shape[-2]
+
+        if no_cache_update:
+            output, new_past = self._attention_with_no_cache_update(queries, keys, values, past, attention_mask, q_len)
+        else:
+            output, new_past = self._attention_with_cache(queries, keys, values, past, attention_mask, q_len)
+
+        assert output.shape == (self.config.num_attention_heads, q_len, self.head_dim)
+        output = output.transpose(1, 0, 2).reshape(-1, self.config.hidden_size)
+
+        result = hk.Linear(self.config.hidden_size, name='o_proj', with_bias=False)(output.reshape(-1, self.config.hidden_size))
+        return result, new_past
+
+    def _attention_with_cache(self, queries, keys, values, past, attention_mask, q_len):
+        past_kv, past_length = past
+        if past_kv is not None:
+            keys, values = [
+                jax.lax.dynamic_update_slice_in_dim(p_tensor, curr_tensor, past_length, axis=1)
+                for p_tensor, curr_tensor in zip(past_kv, [keys, values])
+            ]
+
+        # should output batch x heads x seq x dim
+        if self.use_flash_attention:
+            output = causal_flash_attention(queries, keys, values)
+        else:
+            attention_weights = self._query_key_dot(queries, keys)
+            attention_weights += attention_mask
+            attention_weights = jax.nn.softmax(attention_weights, axis=-1)
+
+            expected_kv_size = q_len if past_kv is None else past_kv[0].shape[1]
+            assert attention_weights.shape == (self.config.num_attention_heads, q_len, expected_kv_size), f'{attention_weights.shape} != {(self.config.num_attention_heads, q_len, expected_kv_size)}'
+
+            output = _weighted_sum_values(attention_weights, values)
+        return output, (keys, values)
+
+
+    def _attention_with_no_cache_update(self, queries, keys, values, past, attention_mask, q_len):
+        if self.use_flash_attention:
+            warnings.warn('Cannot use flash attention when `updatekv_after_dot` is passed, using regular attention')
+
+        past_kv, past_length = past
+
+        past_dots = pv = None
+        if past_kv is not None:
+            pk, pv = past_kv
+            past_dots = self._query_key_dot(queries, pk)
+
+        present_dots = self._query_key_dot(queries, keys)
+        current_weights = present_dots + attention_mask
+
+        past_value_mean = None
+        if past_dots is not None:
+            # past dots is heads x queries x keys
+            mask = jnp.where(jnp.arange(past_dots.shape[-1]) < past_length, 0, -jnp.inf)
+            assert mask.shape == (past_dots.shape[-1],)
+            past_dots += mask
+
+            past_lse = jax.scipy.special.logsumexp(past_dots, axis=-1, keepdims=True)
+            current_lse = jax.scipy.special.logsumexp(current_weights, axis=-1, keepdims=True)
+            total_lse = jnp.logaddexp(past_lse, current_lse)
+
+            past_weights = jnp.exp(past_dots - total_lse)
+            current_weights = jnp.exp(current_weights - total_lse)
+
+            past_value_mean = _weighted_sum_values(past_weights, pv)
+            curr_value_mean = _weighted_sum_values(current_weights, values)
+
+            value_mean = jnp.where(past_length == 0, curr_value_mean, curr_value_mean + past_value_mean)
+        else:
+            current_weights = jax.nn.softmax(current_weights, axis=-1)
+            value_mean = _weighted_sum_values(current_weights, values)
+
+        assert value_mean.shape == (self.config.num_attention_heads, q_len, self.head_dim)
+        return value_mean, (keys, values)
+
+    def _query_key_dot(self, queries, keys):
+        return jnp.einsum('htd,hsd->hts', queries, keys) / jnp.sqrt(self.head_dim)
+
+class LLamaDecoderLayer(ConfigModule):
+    def __init__(self, pos_emb, checkpoint_mlp=False, mlp_block_size=None, use_flash_attention=False, **kwargs):
+        super().__init__(**kwargs)
+        self.pos_emb = pos_emb
+        self.checkpoint_mlp = checkpoint_mlp
+        self.mlp_block_size = mlp_block_size
+        self.use_flash_attention = use_flash_attention
+
+    def __call__(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past,
+        **kwargs
     ):
         residual = hidden_states
 
         norm_output = VarianceOnlyLayerNorm(self.config, name='input_layernorm')(hidden_states)
 
-        attention_layer = LlamaAttention(pos_emb=self.pos_emb, config=self.config, name='self_attn')
+        attention_layer = LlamaAttention(
+            pos_emb=self.pos_emb,
+            config=self.config,
+            name='self_attn',
+            use_flash_attention=self.use_flash_attention
+        )
         if self.checkpoint_mlp:
             attention_layer = hk.remat(attention_layer)
 
@@ -153,7 +219,8 @@ class LLamaDecoderLayer(ConfigModule):
             norm_output,
             attention_mask,
             position_ids,
-            past
+            past,
+            **kwargs
         )
         residual += attn_output
 
@@ -204,6 +271,8 @@ class LlamaModel(ConfigModule):
         checkpoint=False,
         checkpoint_mlp=False,
         mlp_block_size=1,
+        use_flash_attention=False,
+        no_cache_update=False,
     ):
         inp_length = input_ids.shape[-1]
         if past is None:
@@ -229,15 +298,21 @@ class LlamaModel(ConfigModule):
         else:
             past, past_length = past
             if past_cache_size != past[0][0].shape[1]:
-                logger.warning(f'past_cache_size {past_cache_size} != {past[0][0].shape[1]}, passed value wlil be ignored')
+                logger.warning(f'past_cache_size {past_cache_size} != {past[0][0].shape[1]}, passed value will be ignored')
                 past_cache_size = past[0][0].shape[1]
 
             indices = jax.lax.dynamic_slice_in_dim(jnp.arange(past_cache_size), past_length, inp_length)
 
-        attention_mask = _make_causal_mask(
-            indices,
-            past_cache_size=past_cache_size if past_cache_size else None
-        )
+        if no_cache_update:
+            attention_mask = _make_causal_mask(
+                jnp.arange(inp_length),
+                past_cache_size=None,
+            )
+        else:
+            attention_mask = _make_causal_mask(
+                indices,
+                past_cache_size=past_cache_size if past_cache_size else None,
+            )
 
         full_seq_length = inp_length + past_length
         wte = hk.get_parameter(
@@ -260,6 +335,7 @@ class LlamaModel(ConfigModule):
                 name=f'layer_{layer_num}',
                 checkpoint_mlp=checkpoint_mlp,
                 mlp_block_size=mlp_block_size,
+                use_flash_attention=use_flash_attention
             )
             if checkpoint:
                 layer = hk.remat(
@@ -270,7 +346,8 @@ class LlamaModel(ConfigModule):
                 hidden_states,
                 attention_mask,
                 indices,
-                (layer_past, past_length)
+                (layer_past, past_length),
+                no_cache_update=no_cache_update
             )
             hidden_states = jax.ad_checkpoint.checkpoint_name(hidden_states, f'llama_hidden_state_{layer_num}')
             if return_past:

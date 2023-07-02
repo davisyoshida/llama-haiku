@@ -12,10 +12,15 @@ import numpy as np
 from .model import LlamaConfig, LlamaModel
 from .utils import simple_dtype_policy
 
-def load_config(path, name='config.json'):
+def load_config(path, name='config.json', overwrite_config_vals=None):
     path = Path(path)
+
     with (path / name).open() as f:
-        return LlamaConfig(**json.load(f))
+        conf_dict = json.load(f)
+    if overwrite_config_vals is not None:
+        conf_dict.update(overwrite_config_vals)
+
+    return LlamaConfig(**conf_dict)
 
 def load_weights(path, name='weights.pkl', device=None):
     path = Path(path)
@@ -41,15 +46,33 @@ def load_weights(path, name='weights.pkl', device=None):
     mapped_params.reverse()
     return jax.tree_util.tree_unflatten(structure, mapped_params)
 
-def get_model(model_dir, return_past=False, return_hidden=False, device=None, custom_getter=None, get_params=True):
+def get_model(
+    model_dir,
+    return_past=False,
+    return_hidden=False,
+    device=None,
+    custom_getter=None,
+    get_params=True,
+    overwrite_config_vals=None,
+    return_config=False
+):
     model_dir = Path(model_dir)
-    config = load_config(model_dir)
+    config = load_config(model_dir, overwrite_config_vals=overwrite_config_vals)
 
     params = load_weights(model_dir, device=device) if get_params else None
 
-    simple_dtype_policy()
+    #simple_dtype_policy()
 
-    def fn(input_ids, use_cache_size=None, past=None, do_checkpoint=False, do_mlp_checkpoint=False, mlp_block_size=None):
+    def fn(
+        input_ids,
+        past=None,
+        use_cache_size=None,
+        do_checkpoint=False,
+        do_mlp_checkpoint=False,
+        mlp_block_size=None,
+        use_flash_attention=False,
+        no_cache_update=False
+    ):
         with hk.custom_getter(custom_getter) if custom_getter is not None else nullcontext():
             model = LlamaModel(config)
             ret = model(
@@ -60,12 +83,19 @@ def get_model(model_dir, return_past=False, return_hidden=False, device=None, cu
                 return_hidden=return_hidden,
                 checkpoint=do_checkpoint,
                 checkpoint_mlp=do_mlp_checkpoint,
-                mlp_block_size=mlp_block_size
+                mlp_block_size=mlp_block_size,
+                no_cache_update=no_cache_update
             )
         return ret
 
     model = hk.without_apply_rng(hk.transform(fn))
-    return model, params
+    ret = (model, params)
+    if return_config:
+        ret += (config,)
+
+    return ret
+
+
 
 def get_generator(
     model_dir,
@@ -74,13 +104,16 @@ def get_generator(
     apply_wrapper=None,
     return_hidden=False,
     params_wrapper=None,
-    device=None
+    device=None,
+    overwrite_config_vals=None,
+    use_flash_attention=False
 ):
     model, params = get_model(
         model_dir,
         return_past=True,
         return_hidden=return_hidden,
-        device=device
+        device=device,
+        overwrite_config_vals=overwrite_config_vals
     )
 
     apply_fn = model.apply
@@ -90,7 +123,7 @@ def get_generator(
         params = params_wrapper(params)
 
     def model_fn(params, input_ids, use_cache_size, past):
-        ret = apply_fn(params, input_ids, use_cache_size, past)
+        ret = apply_fn(params, input_ids, use_cache_size, past, use_flash_attention=use_flash_attention)
         return ret
 
     donate_argnums = (3,) if donate_past else ()

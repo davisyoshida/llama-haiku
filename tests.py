@@ -8,6 +8,7 @@ import pytest
 
 from llama_haiku import LlamaModel, LlamaConfig
 from llama_haiku.model import LlamaRotaryEmbedding
+from llama_haiku.load import get_model
 
 @pytest.fixture
 def small_config():
@@ -20,6 +21,10 @@ def small_config():
         rms_norm_eps=1e-5,
         num_hidden_layers=3
     )
+
+@pytest.fixture
+def small_model():
+    return get_model('test_data/small_model/', return_past=True)
 
 def test_init(small_config):
     def f(ids):
@@ -94,3 +99,32 @@ def test_rotary_embedding(small_config):
         expected_q_emb = pickle.load(f)
 
     assert jnp.allclose(q_emb, expected_q_emb, atol=1e-5, rtol=1e-5)
+
+
+def test_no_update_cache(small_model):
+    model, params = small_model 
+    model_fn = jax.jit(model.apply, static_argnames=('no_cache_update',))
+    model_fn = model.apply
+
+    full_input = jnp.arange(1, 9)
+
+    full_output = model_fn(params, full_input)
+    full_logits = full_output['logits']
+
+    original_past = full_output['past']
+
+    split = full_input.shape[0] - 1
+    initial_output = model_fn(params, full_input[:split], no_cache_update=False)
+
+    initial_past = initial_output['past']
+
+    second_output = model_fn(params, full_input[split:], past=initial_past, no_cache_update=False)
+
+    combined_logits = jnp.concatenate([initial_output['logits'], second_output['logits']], axis=0)
+
+    max_gap = jnp.max(jnp.abs(full_logits - combined_logits))
+    print(f'Max gap: {max_gap:.3e}')
+    full_dist = jax.nn.softmax(full_logits[-1])
+    split_dist = jax.nn.softmax(combined_logits[-1])
+
+    print(f'Average dist gap: {jnp.mean(jnp.abs(full_dist - split_dist)):.3e}')

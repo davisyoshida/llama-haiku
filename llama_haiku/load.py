@@ -86,7 +86,7 @@ def get_model(
             )
         return ret
 
-    model = hk.transform(fn, apply_rng=False)
+    model = hk.without_apply_rng(hk.transform(fn))
     ret = (model, params)
     if return_config:
         ret += (config,)

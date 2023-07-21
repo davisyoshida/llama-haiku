@@ -35,8 +35,7 @@ class ConfigModule(hk.Module):
 class VarianceOnlyLayerNorm(ConfigModule):
     """LayerNorm but without subtracting the mean"""
     def __call__(self, x):
-        # TODO: Decide if use_fast_variance technique from hk.LayerNorm is helpful
-        variance = jnp.var(x.astype(jnp.float32), axis=-1, keepdims=True)
+        variance = jnp.mean((x.astype(jnp.float32) ** 2), axis=-1, keepdims=True)
         scale = hk.get_parameter(
             'weight',
             x.shape[-1:],
@@ -58,11 +57,11 @@ class LlamaRotaryEmbedding(ConfigModule):
         head_dim = self.config.hidden_size // self.config.num_attention_heads
         dtype = get_dtype()
 
-        inv_freq = 1 / (self.base ** (jnp.arange(0, head_dim, 2.0, dtype=dtype) / head_dim))
+        inv_freq = 1 / (self.base ** (jnp.arange(0, head_dim, 2.0, dtype=jnp.float32) / head_dim))
         freqs = jnp.arange(self.config.max_position_embeddings)[:, None] * inv_freq[None, :]
         emb = jnp.concatenate([freqs, freqs], axis=-1)
-        self.sin = jnp.sin(emb)
-        self.cos = jnp.cos(emb)
+        self.sin = jnp.sin(emb).astype(dtype)
+        self.cos = jnp.cos(emb).astype(dtype)
 
     def __call__(self, queries, keys, pos_ids):
         cos = self.cos[pos_ids]
@@ -135,7 +134,9 @@ class LlamaAttention(ConfigModule):
         else:
             attention_weights = self._query_key_dot(queries, keys)
             attention_weights += attention_mask
-            attention_weights = jax.nn.softmax(attention_weights, axis=-1)
+            out_type = attention_weights.dtype
+            attention_weights = jax.nn.softmax(attention_weights.astype(jnp.float32), axis=-1)
+            attention_weights = attention_weights.astype(out_type)
 
             expected_kv_size = q_len if past_kv is None else past_kv[0].shape[1]
             assert attention_weights.shape == (self.config.num_attention_heads, q_len, expected_kv_size), f'{attention_weights.shape} != {(self.config.num_attention_heads, q_len, expected_kv_size)}'
@@ -153,10 +154,12 @@ class LlamaAttention(ConfigModule):
         past_dots = pv = None
         if past_kv is not None:
             pk, pv = past_kv
-            past_dots = self._query_key_dot(queries, pk)
+            past_dots = self._query_key_dot(queries, pk).astype(jnp.float32)
+
+        out_dtype = queries.dtype
 
         present_dots = self._query_key_dot(queries, keys)
-        current_weights = present_dots + attention_mask
+        current_weights = (present_dots + attention_mask).astype(jnp.float32)
 
         past_value_mean = None
         if past_dots is not None:
@@ -169,15 +172,15 @@ class LlamaAttention(ConfigModule):
             current_lse = jax.scipy.special.logsumexp(current_weights, axis=-1, keepdims=True)
             total_lse = jnp.logaddexp(past_lse, current_lse)
 
-            past_weights = jnp.exp(past_dots - total_lse)
-            current_weights = jnp.exp(current_weights - total_lse)
+            past_weights = jnp.exp(past_dots - total_lse).astype(out_dtype)
+            current_weights = jnp.exp(current_weights - total_lse).astype(out_dtype)
 
             past_value_mean = _weighted_sum_values(past_weights, pv)
             curr_value_mean = _weighted_sum_values(current_weights, values)
 
             value_mean = jnp.where(past_length == 0, curr_value_mean, curr_value_mean + past_value_mean)
         else:
-            current_weights = jax.nn.softmax(current_weights, axis=-1)
+            current_weights = jax.nn.softmax(current_weights, axis=-1).astype(out_dtype)
             value_mean = _weighted_sum_values(current_weights, values)
 
         assert value_mean.shape == (self.config.num_attention_heads, q_len, self.head_dim)

@@ -10,7 +10,6 @@ import haiku as hk
 import numpy as np
 
 from .model import LlamaConfig, LlamaModel
-from .utils import simple_dtype_policy
 
 def load_config(path, name='config.json', overwrite_config_vals=None):
     path = Path(path)
@@ -24,8 +23,9 @@ def load_config(path, name='config.json', overwrite_config_vals=None):
 
 def load_weights(path, name='weights.pkl', device=None):
     path = Path(path)
-    with (path / name).open('rb') as f:
-        params = pickle.load(f)
+    with (jax.default_device(device) if device is not None else nullcontext()):
+        with (path / name).open('rb') as f:
+            params = pickle.load(f)
     if device is None:
         device = jax.devices('gpu')[0]
 
@@ -60,8 +60,6 @@ def get_model(
     config = load_config(model_dir, overwrite_config_vals=overwrite_config_vals)
 
     params = load_weights(model_dir, device=device) if get_params else None
-
-    #simple_dtype_policy()
 
     def fn(
         input_ids,
@@ -126,8 +124,8 @@ def get_generator(
         ret = apply_fn(params, input_ids, use_cache_size, past, use_flash_attention=use_flash_attention)
         return ret
 
-    donate_argnums = (3,) if donate_past else ()
-    jit_fn = jax.jit(model_fn, static_argnums=(2,), donate_argnums=donate_argnums)
+    donate_argnums = (2,) if donate_past else ()
+    jit_fn = jax.jit(model_fn, static_argnums=(3,), donate_argnums=donate_argnums)
 
     def step_fn(input_ids, past=None):
         input_length = input_ids.shape[-1]
@@ -151,7 +149,7 @@ def get_generator(
             if added_padding > 0:
                 input_ids = jnp.pad(input_ids, ((0, added_padding)), constant_values=0)
 
-        result = jit_fn(params, input_ids, use_cache_size, past)
+        result = jit_fn(params, input_ids, past, use_cache_size)
 
         if added_padding > 0:
             result['logits'] = result['logits'][:-added_padding, :]

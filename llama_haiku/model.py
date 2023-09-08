@@ -340,6 +340,7 @@ class LlamaModel(ConfigModule):
                 mlp_block_size=mlp_block_size,
                 use_flash_attention=use_flash_attention
             )
+            layer = partial(layer, no_cache_update=no_cache_update)
             if checkpoint:
                 layer = hk.remat(
                     layer,
@@ -350,7 +351,6 @@ class LlamaModel(ConfigModule):
                 attention_mask,
                 indices,
                 (layer_past, past_length),
-                no_cache_update=no_cache_update
             )
             hidden_states = jax.ad_checkpoint.checkpoint_name(hidden_states, f'llama_hidden_state_{layer_num}')
             if return_past:
